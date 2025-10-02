@@ -19,19 +19,19 @@ class AIChatHelper:
         if api_key:
             try:
                 genai.configure(api_key=api_key)
-                # Use the new model naming format with speed optimizations
+                # Use the new model naming format with balanced config
                 generation_config = {
-                    "temperature": 0.3,  # Lower = more focused/faster
-                    "top_p": 0.8,
-                    "top_k": 20,
-                    "max_output_tokens": 200,  # Limit output for speed
+                    "temperature": 0.7,  # Higher for more natural conversation
+                    "top_p": 0.95,
+                    "top_k": 40,
+                    "max_output_tokens": 500,  # More tokens for better responses
                 }
                 self.model = genai.GenerativeModel(
                     'gemini-2.0-flash',
                     generation_config=generation_config
                 )
                 self.enabled = True
-                print("AI chat enabled with Gemini 2.0 Flash (optimized)")
+                print("AI chat enabled with Gemini 2.0 Flash")
             except Exception as e:
                 print(f"Failed to initialize Gemini: {e}")
                 self.enabled = False
@@ -57,27 +57,54 @@ class AIChatHelper:
         try:
             today = datetime.now()
 
-            # Build conversation context if history exists (keep it short)
+            # Build conversation context if history exists
             context = ""
             if chat_history and len(chat_history) > 1:
-                context = "\nRecent context:\n"
-                # Include last 2 exchanges for context (reduced for speed)
-                for msg in chat_history[-4:]:
-                    role = "U" if msg["role"] == "user" else "A"
-                    context += f"{role}: {msg['content'][:80]}\n"
+                context = "\n\nConversation history (for context):\n"
+                # Include last 3 exchanges for better context
+                for msg in chat_history[-6:]:
+                    role = "User" if msg["role"] == "user" else "Assistant"
+                    context += f"{role}: {msg['content']}\n"
 
-            prompt = f"""Today: {today.strftime('%Y-%m-%d, %A')}
+            prompt = f"""You are a friendly badminton court booking assistant and you are working at MSAC Sport Center. Today is {today.strftime('%A, %B %d, %Y')}.
 {context}
-Message: "{user_message}"
 
-Extract JSON: {{"intent": "check_availability"|"book"|"help"|"greeting"|"unknown", "date": "YYYY-MM-DD"|null, "time": "HH:MM"|null, "friendly_response": "short text"}}
+User's message: "{user_message}"
 
-Date rules: tomorrow={today + timedelta(days=1):%Y-%m-%d}, today={today:%Y-%m-%d}, day names=next occurrence
-Time rules: 6pm=18:00, 10am=10:00, morning/evening=null
-Intent: check_availability for "what's available", book for "I want to book", help/greeting as appropriate
-Follow-ups: use context to determine date/time
+Your task:
+1. Understand what the user wants (check availability, book a court, ask for help, greeting, or other)
+2. Extract any date and time mentioned (use conversation context for follow-ups like "what about the next day")
+3. Provide a friendly, natural response
 
-JSON only:"""
+Date parsing rules:
+- "tomorrow" = {(today + timedelta(days=1)).strftime('%Y-%m-%d')}
+- "today" = {today.strftime('%Y-%m-%d')}
+- Day names (Monday, Tuesday, etc) = next occurrence of that day
+- "next Friday" = the upcoming Friday
+- If user says "what about Friday" after asking about Thursday, they mean THIS Friday
+
+Time parsing rules:
+- "6pm", "6 pm", "18:00" = 18:00
+- "morning" = null (show all morning slots)
+- "evening" = null (show all evening slots)
+- Be flexible with time formats
+
+Intent rules:
+- "check_availability": User wants to see what's available
+- "book": User wants to book a court
+- "help": User needs assistance
+- "greeting": User is saying hi/hello
+- "unknown": You're not sure
+
+Response in JSON format:
+{{
+  "intent": "check_availability" | "book" | "help" | "greeting" | "unknown",
+  "date": "YYYY-MM-DD" or null,
+  "time": "HH:MM" or null,
+  "friendly_response": "A warm, natural response that acknowledges what they asked and shows you understood"
+}}
+
+JSON response:"""
 
             response = self.model.generate_content(prompt)
             result_text = response.text.strip()
@@ -123,18 +150,33 @@ JSON only:"""
         if not slots:
             return "No available slots found."
 
+        def format_duration(iso_duration: str) -> str:
+            """Convert PT30M to '30 min'"""
+            import re
+            hours = re.search(r'(\d+)H', iso_duration)
+            minutes = re.search(r'(\d+)M', iso_duration)
+            h = int(hours.group(1)) if hours else 0
+            m = int(minutes.group(1)) if minutes else 0
+            parts = []
+            if h > 0:
+                parts.append(f"{h} hour" if h == 1 else f"{h} hours")
+            if m > 0:
+                parts.append(f"{m} min")
+            return " ".join(parts) if parts else "Unknown"
+
         lines = []
         for i, slot in enumerate(slots[:max_slots]):
             start_dt = datetime.fromisoformat(slot['start_time'])
             end_dt = datetime.fromisoformat(slot['end_time'])
+            duration = format_duration(slot['duration'])
             lines.append(
-                f"{i+1}. {start_dt.strftime('%I:%M %p')} - {end_dt.strftime('%I:%M %p')} "
-                f"({slot['duration']})"
+                f"{i+1}. **{start_dt.strftime('%I:%M %p')}** - {end_dt.strftime('%I:%M %p')} "
+                f"({duration})"
             )
 
         result = "\n".join(lines)
 
         if len(slots) > max_slots:
-            result += f"\n\n...and {len(slots) - max_slots} more slots available"
+            result += f"\n\n...and **{len(slots) - max_slots} more slots** available"
 
         return result

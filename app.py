@@ -2,6 +2,7 @@
 Badminton Court Booking Application
 """
 import streamlit as st
+import re
 from datetime import datetime, timedelta
 from auth import UserAuth
 from storage import SecureStorage
@@ -12,6 +13,35 @@ from ai_chat_helper import AIChatHelper
 # Initialize services
 user_auth = UserAuth()
 storage = SecureStorage()
+
+
+def format_duration(iso_duration: str) -> str:
+    """
+    Convert ISO 8601 duration (e.g., PT30M, PT1H, PT1H30M) to friendly text
+
+    Args:
+        iso_duration: ISO 8601 duration string like 'PT30M'
+
+    Returns:
+        Friendly duration string like '30 min' or '1 hour 30 min'
+    """
+    if not iso_duration:
+        return "Unknown"
+
+    # Parse hours and minutes from PT1H30M format
+    hours_match = re.search(r'(\d+)H', iso_duration)
+    minutes_match = re.search(r'(\d+)M', iso_duration)
+
+    hours = int(hours_match.group(1)) if hours_match else 0
+    minutes = int(minutes_match.group(1)) if minutes_match else 0
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+    if minutes > 0:
+        parts.append(f"{minutes} min")
+
+    return " ".join(parts) if parts else "Unknown"
 
 
 def init_session_state():
@@ -248,12 +278,16 @@ def process_chat_message(message: str) -> str:
         except:
             return "I had trouble parsing that date. Please try again!"
 
-        # Get credentials and login
+        # Get credentials and reuse or create client
         creds = storage.get_credentials(st.session_state.username)
-        client = PerfectGymClient()
+        client = st.session_state.get('perfectgym_client')
 
-        if not client.login(creds['email'], creds['password']):
-            return "❌ Failed to connect to PerfectGym. Please check your credentials in Settings."
+        # Check if we need to login
+        if not client or not client.is_session_valid():
+            client = PerfectGymClient()
+            if not client.login(creds['email'], creds['password']):
+                return "❌ Failed to connect to PerfectGym. Please check your credentials in Settings."
+            st.session_state.perfectgym_client = client
 
         # Fetch schedule
         schedule = client.get_schedule(days=14)
@@ -330,65 +364,78 @@ def view_schedule_page():
             # Get credentials
             creds = storage.get_credentials(st.session_state.username)
 
-            # Login to PerfectGym
-            client = PerfectGymClient()
-            if client.login(creds['email'], creds['password']):
-                st.session_state.perfectgym_client = client
+            # Reuse existing client or create new one
+            client = st.session_state.get('perfectgym_client')
 
-                # Fetch schedule
-                schedule = client.get_schedule(days=days_to_show)
-
-                if schedule:
-                    st.success(f"✅ Found {len(schedule)} available slots")
-
-                    # Group by date
-                    from collections import defaultdict
-                    by_date = defaultdict(list)
-
-                    for slot in schedule:
-                        start_dt = datetime.fromisoformat(slot['start_time'])
-                        date_key = start_dt.strftime('%A, %B %d, %Y')
-                        by_date[date_key].append(slot)
-
-                    # Display by date
-                    for date_str in sorted(by_date.keys(), key=lambda x: datetime.strptime(x, '%A, %B %d, %Y')):
-                        st.subheader(f"📆 {date_str}")
-
-                        slots = by_date[date_str]
-
-                        # Show first 10 slots per day, with option to show more
-                        display_count = 10
-                        if f"show_more_{date_str}" in st.session_state:
-                            display_count = len(slots)
-
-                        for slot in slots[:display_count]:
-                            start_dt = datetime.fromisoformat(slot['start_time'])
-                            end_dt = datetime.fromisoformat(slot['end_time'])
-
-                            col1, col2, col3 = st.columns([3, 2, 1])
-
-                            with col1:
-                                st.write(f"⏰ **{start_dt.strftime('%I:%M %p')}** - {end_dt.strftime('%I:%M %p')}")
-
-                            with col2:
-                                st.write(f"⏱️ Duration: {slot['duration']}")
-
-                            with col3:
-                                booking_url = client.get_booking_url(start_dt)
-                                st.link_button("📱 Book", booking_url, use_container_width=True)
-
-                            st.divider()
-
-                        # Show more button
-                        if len(slots) > 10 and f"show_more_{date_str}" not in st.session_state:
-                            if st.button(f"Show {len(slots) - 10} more slots", key=f"btn_more_{date_str}"):
-                                st.session_state[f"show_more_{date_str}"] = True
-                                st.rerun()
-
+            # Check if we need to login
+            if not client or not client.is_session_valid():
+                client = PerfectGymClient()
+                if client.login(creds['email'], creds['password']):
+                    st.session_state.perfectgym_client = client
                 else:
-                    st.info("No available slots found for the selected date range")
-            else:
-                st.error("❌ Failed to connect to PerfectGym. Please check your credentials in Settings.")
+                    st.error("❌ Failed to connect to PerfectGym. Please check your credentials in Settings.")
+                    st.stop()
+
+            # Convert selected_date to datetime for the API
+            selected_datetime = datetime.combine(selected_date, datetime.min.time())
+
+            # Fetch schedule for the selected date
+            schedule = client.get_schedule(date=selected_datetime, days=days_to_show)
+
+            # Store in session state for persistence
+            st.session_state.schedule_data = schedule
+            st.session_state.schedule_client = client
+
+    # Display schedule if available
+    if 'schedule_data' in st.session_state and st.session_state.schedule_data:
+        schedule = st.session_state.schedule_data
+        client = st.session_state.schedule_client
+
+        st.success(f"✅ Found {len(schedule)} available slots")
+
+        # Group by date
+        from collections import defaultdict
+        by_date = defaultdict(list)
+
+        for slot in schedule:
+            start_dt = datetime.fromisoformat(slot['start_time'])
+            date_key = start_dt.strftime('%A, %B %d, %Y')
+            by_date[date_key].append(slot)
+
+        # Display by date
+        for date_str in sorted(by_date.keys(), key=lambda x: datetime.strptime(x, '%A, %B %d, %Y')):
+            st.subheader(f"📆 {date_str}")
+
+            slots = by_date[date_str]
+
+            # Show first 10 slots per day, with option to show more
+            display_count = 10
+            if f"show_more_{date_str}" in st.session_state:
+                display_count = len(slots)
+
+            for slot in slots[:display_count]:
+                start_dt = datetime.fromisoformat(slot['start_time'])
+                end_dt = datetime.fromisoformat(slot['end_time'])
+
+                col1, col2, col3 = st.columns([3, 2, 1])
+
+                with col1:
+                    st.write(f"⏰ **{start_dt.strftime('%I:%M %p')}** - {end_dt.strftime('%I:%M %p')}")
+
+                with col2:
+                    st.write(f"⏱️ Duration: {format_duration(slot['duration'])}")
+
+                with col3:
+                    booking_url = client.get_booking_url(start_dt)
+                    st.link_button("📱 Book", booking_url, use_container_width=True)
+
+                st.divider()
+
+            # Show more button
+            if len(slots) > 10 and f"show_more_{date_str}" not in st.session_state:
+                if st.button(f"Show {len(slots) - 10} more slots", key=f"btn_more_{date_str}"):
+                    st.session_state[f"show_more_{date_str}"] = True
+                    st.rerun()
 
 
 def my_bookings_page():
@@ -398,7 +445,7 @@ def my_bookings_page():
     st.info("💡 To view and manage your bookings, please visit the PerfectGym website.")
 
     # Direct link to bookings page
-    bookings_url = "https://statesportcentres.perfectgym.com.au/ClientPortal2/#/MyBookings"
+    bookings_url = "https://statesportcentres.perfectgym.com.au/ClientPortal2/#/MyCalendar"
 
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:

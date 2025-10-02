@@ -4,7 +4,7 @@ PerfectGym API Client for interacting with the badminton booking website
 import requests
 import uuid
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
 
@@ -27,6 +27,70 @@ class PerfectGymClient:
         self.access_token = None
         self.user_id = None
         self.email = None
+        self.password = None  # Store for auto-refresh
+        self.last_activity = None
+
+        # Timeout and retry settings
+        self.timeout = 30  # seconds
+        self.max_retries = 3
+        self.retry_delay = 1  # seconds
+
+    def _make_request_with_retry(self, method: str, url: str, **kwargs) -> Tuple[bool, Optional[requests.Response]]:
+        """
+        Make HTTP request with retry logic and timeout handling
+
+        Returns:
+            Tuple of (success: bool, response: Optional[Response])
+        """
+        for attempt in range(self.max_retries):
+            try:
+                # Add timeout to all requests
+                kwargs.setdefault('timeout', self.timeout)
+
+                response = self.session.request(method, url, **kwargs)
+
+                # Update last activity time
+                self.last_activity = datetime.now()
+
+                # Check for session expiration (401 or 403)
+                if response.status_code in [401, 403]:
+                    # Try to refresh session
+                    if self.email and self.password and attempt < self.max_retries - 1:
+                        print(f"Session expired, attempting to re-login... (attempt {attempt + 1})")
+                        if self.login(self.email, self.password):
+                            # Retry the request after re-login
+                            continue
+                    return False, response
+
+                return True, response
+
+            except requests.exceptions.Timeout:
+                print(f"Request timeout (attempt {attempt + 1}/{self.max_retries})")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (attempt + 1))  # Exponential backoff
+                    continue
+                return False, None
+
+            except requests.exceptions.RequestException as e:
+                print(f"Request error: {e} (attempt {attempt + 1}/{self.max_retries})")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                return False, None
+
+        return False, None
+
+    def is_session_valid(self) -> bool:
+        """Check if session is still valid"""
+        if not self.access_token or not self.last_activity:
+            return False
+
+        # Session expires after 30 minutes of inactivity
+        session_timeout = timedelta(minutes=30)
+        if datetime.now() - self.last_activity > session_timeout:
+            return False
+
+        return True
 
     def login(self, email: str, password: str) -> bool:
         """
@@ -42,7 +106,7 @@ class PerfectGymClient:
                 "Password": password
             }
 
-            response = self.session.post(login_url, json=payload)
+            response = self.session.post(login_url, json=payload, timeout=self.timeout)
 
             if response.status_code == 200:
                 data = response.json()
@@ -51,6 +115,8 @@ class PerfectGymClient:
                     member = data['User']['Member']
                     self.user_id = member.get('Id')
                     self.email = member.get('Email')
+                    self.password = password  # Store for auto-refresh
+                    self.last_activity = datetime.now()
 
                     # Extract JWT token from cookies
                     if 'CpAuthToken' in self.session.cookies:
@@ -78,14 +144,31 @@ class PerfectGymClient:
         Get badminton court availability schedule
 
         Args:
-            date: Starting date (defaults to today)
+            date: Starting date (defaults to today). If provided, will fetch schedule for the week containing this date
             days: Number of days to fetch (default 7)
 
         Returns:
             List of available time slots (flattened)
         """
         try:
+            # Validate session before making request
+            if not self.is_session_valid() and self.email and self.password:
+                print("Session expired, refreshing...")
+                if not self.login(self.email, self.password):
+                    print("Failed to refresh session")
+                    return []
+
             schedule_url = f"{self.base_url}/ClientPortal2/FacilityBookings/FacilityCalendar/GetWeeklySchedule"
+
+            # If a specific date is requested, ensure we fetch enough days to include it
+            # The API returns schedule starting from current server time
+            requested_days = days  # Store the originally requested number of days
+            if date:
+                now = datetime.now()
+                days_until_target = (date.date() - now.date()).days
+                # Fetch enough days to reach the target date PLUS the requested number of days
+                if days_until_target > 0:
+                    days = days_until_target + requested_days
 
             payload = {
                 "clubId": self.club_id,
@@ -94,7 +177,11 @@ class PerfectGymClient:
                 "daysInWeek": days
             }
 
-            response = self.session.post(schedule_url, json=payload)
+            success, response = self._make_request_with_retry('POST', schedule_url, json=payload)
+
+            if not success or not response:
+                print("Failed to fetch schedule after retries")
+                return []
 
             if response.status_code == 200:
                 data = response.json()
@@ -103,7 +190,7 @@ class PerfectGymClient:
 
                 if 'CalendarData' in data:
                     for hour_block in data['CalendarData']:
-                        # Each hour_block has ClassesPerDay which is an array of 7 days
+                        # Each hour_block has ClassesPerDay which is an array of days
                         for day_index, day_slots in enumerate(hour_block.get('ClassesPerDay', [])):
                             for slot in day_slots:
                                 # Only include bookable slots
@@ -119,6 +206,28 @@ class PerfectGymClient:
 
                 # Sort by start time
                 slots.sort(key=lambda x: x['start_time'])
+
+                # Debug: Print date range of fetched slots
+                if slots:
+                    print(f"DEBUG: Fetched {len(slots)} total slots")
+                    print(f"DEBUG: First slot: {slots[0]['start_time']}")
+                    print(f"DEBUG: Last slot: {slots[-1]['start_time']}")
+
+                # Filter by date range if provided
+                if date:
+                    # Create date range: from selected date to selected date + requested_days
+                    end_date = date + timedelta(days=requested_days)
+                    print(f"DEBUG: Filtering for date range: {date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+
+                    filtered_slots = []
+                    for s in slots:
+                        slot_date = datetime.fromisoformat(s['start_time']).date()
+                        if date.date() <= slot_date < end_date.date():
+                            filtered_slots.append(s)
+
+                    print(f"DEBUG: Found {len(filtered_slots)} slots in date range")
+                    return filtered_slots
+
                 return slots
             else:
                 print(f"Failed to fetch schedule: {response.status_code}")
@@ -168,6 +277,12 @@ class PerfectGymClient:
             dict with success status and booking details, or error info
         """
         try:
+            # Validate session before booking
+            if not self.is_session_valid() and self.email and self.password:
+                print("Session expired, refreshing before booking...")
+                if not self.login(self.email, self.password):
+                    return {"success": False, "error": "Session expired. Please login again."}
+
             # Step 1: Start the booking wizard (GET)
             start_url = f"{self.base_url}/ClientPortal2/FacilityBookings/BookFacility/Start"
             start_params = {
@@ -177,9 +292,9 @@ class PerfectGymClient:
                 "RedirectUrl": f"{self.base_url}/ClientPortal2/"
             }
 
-            start_response = self.session.get(start_url, params=start_params)
-            if start_response.status_code != 200:
-                return {"success": False, "error": f"Failed to start booking: {start_response.status_code}"}
+            success, start_response = self._make_request_with_retry('GET', start_url, params=start_params)
+            if not success or start_response.status_code != 200:
+                return {"success": False, "error": f"Failed to start booking: {start_response.status_code if start_response else 'timeout'}"}
 
             # Small delay to mimic human interaction
             time.sleep(0.5)
@@ -194,9 +309,9 @@ class PerfectGymClient:
                 "RequiredNumberOfSlots": None
             }
 
-            details_response = self.session.post(details_url, json=details_payload)
-            if details_response.status_code != 200:
-                error_msg = details_response.text
+            success, details_response = self._make_request_with_retry('POST', details_url, json=details_payload)
+            if not success or details_response.status_code != 200:
+                error_msg = details_response.text if details_response else "timeout"
                 return {"success": False, "error": f"Failed to set booking details: {error_msg}"}
 
             # Extract rule ID from response
@@ -218,9 +333,9 @@ class PerfectGymClient:
                 "ShouldBuyRequiredProductOnDebit": True
             }
 
-            confirm_response = self.session.post(confirm_url, json=confirm_payload)
-            if confirm_response.status_code != 200:
-                return {"success": False, "error": f"Failed to confirm booking: {confirm_response.status_code}"}
+            success, confirm_response = self._make_request_with_retry('POST', confirm_url, json=confirm_payload)
+            if not success or confirm_response.status_code != 200:
+                return {"success": False, "error": f"Failed to confirm booking: {confirm_response.status_code if confirm_response else 'timeout'}"}
 
             # Check if booking was successful
             confirm_data = confirm_response.json()
@@ -247,6 +362,12 @@ class PerfectGymClient:
             List of user's bookings
         """
         try:
+            # Validate session
+            if not self.is_session_valid() and self.email and self.password:
+                print("Session expired, refreshing...")
+                if not self.login(self.email, self.password):
+                    return []
+
             bookings_url = f"{self.base_url}/Api/FacilityBooking/MyBookings"
 
             params = {
@@ -254,9 +375,9 @@ class PerfectGymClient:
                 "userId": self.user_id
             }
 
-            response = self.session.get(bookings_url, params=params)
+            success, response = self._make_request_with_retry('GET', bookings_url, params=params)
 
-            if response.status_code == 200:
+            if success and response and response.status_code == 200:
                 return response.json()
             else:
                 return []
@@ -276,6 +397,12 @@ class PerfectGymClient:
             True if cancellation successful, False otherwise
         """
         try:
+            # Validate session
+            if not self.is_session_valid() and self.email and self.password:
+                print("Session expired, refreshing...")
+                if not self.login(self.email, self.password):
+                    return False
+
             cancel_url = f"{self.base_url}/Api/FacilityBooking/Cancel"
 
             payload = {
@@ -283,9 +410,9 @@ class PerfectGymClient:
                 "clubId": self.club_id
             }
 
-            response = self.session.post(cancel_url, json=payload)
+            success, response = self._make_request_with_retry('POST', cancel_url, json=payload)
 
-            return response.status_code in [200, 204]
+            return success and response and response.status_code in [200, 204]
 
         except Exception as e:
             print(f"Cancellation error: {e}")
