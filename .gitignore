@@ -1,0 +1,22 @@
+# Environment variables
+.env
+
+# User data
+users.json
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+.claude/
+.claude_cache/
+.claude_workspace/
